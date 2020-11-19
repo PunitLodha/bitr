@@ -38,6 +38,14 @@ impl fmt::Display for TrackerResponse {
 }
 
 pub fn send_tracker_request(url: Url) {
+    match url.scheme() {
+        "https" => handle_https_scheme(url),
+        "udp" => todo!("Support for UDP trackers"),
+        _ => panic!("Url scheme not supported"),
+    };
+}
+
+fn handle_https_scheme(url: Url) {
     // send get request to tracker
     let mut response = reqwest::blocking::get(url).unwrap();
     //println!("{:?}", response.text().unwrap());
@@ -47,17 +55,4 @@ pub fn send_tracker_request(url: Url) {
     // deserialize response to TrackerResponse
     let tracker_res = de::from_bytes::<TrackerResponse>(&buf).expect("Err");
     println!("{}", tracker_res);
-
-    /* match announce_url.scheme() {
-        "https" => {
-            let info = torrent.info;
-            let ser_info = ser::to_bytes(&info).unwrap();
-            let mut hasher = Sha1::new();
-            hasher.update(ser_info);
-            let res = hasher.finalize();
-            println!("{:x}", res);
-        }
-        "udp" => todo!("Support for UDP trackers"),
-        _ => panic!("Url scheme not supported"),
-    }; */
 }
