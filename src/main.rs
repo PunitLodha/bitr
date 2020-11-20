@@ -6,6 +6,7 @@ extern crate serde_derive;
 mod torrent;
 mod tracker;
 mod utils;
+
 use crate::torrent::Torrent;
 
 fn main() {
@@ -15,7 +16,10 @@ fn main() {
 
     let torrent = Torrent::new(&path);
     println!("{}", &torrent);
-    let url = torrent.generate_tracker_url();
+
+    let peer_id = utils::generate_peer_id();
+
+    let url = torrent.generate_tracker_url(&peer_id);
     println!("{}", url.as_str());
 
     tracker::send_tracker_request(url);
