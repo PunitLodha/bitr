@@ -1,10 +1,7 @@
 use std::path::Path;
 
-extern crate serde;
-extern crate serde_bencode;
 #[macro_use]
 extern crate serde_derive;
-extern crate serde_bytes;
 
 mod torrent;
 mod tracker;
