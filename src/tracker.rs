@@ -3,16 +3,18 @@ use serde_bencode::de;
 use serde_bytes::ByteBuf;
 use std::fmt;
 
+use crate::Result;
+
 #[derive(Debug, Deserialize)]
-struct Peer {
-    ip: String,
-    port: i64,
+pub struct TrackerPeer {
+    pub ip: String,
+    pub port: u16,
     #[serde(rename = "peer id")]
-    peer_id: ByteBuf,
+    pub peer_id: ByteBuf,
 }
 #[derive(Debug, Deserialize)]
-struct TrackerResponse {
-    peers: Vec<Peer>,
+pub struct TrackerResponse {
+    pub peers: Vec<TrackerPeer>,
     complete: i64,
     incomplete: i64,
     interval: i64,
@@ -37,22 +39,23 @@ impl fmt::Display for TrackerResponse {
     }
 }
 
-pub fn send_tracker_request(url: Url) {
+pub fn send_tracker_request(url: Url) -> Result<TrackerResponse> {
     match url.scheme() {
         "https" => handle_https_scheme(url),
         "udp" => todo!("Support for UDP trackers"),
-        _ => panic!("Url scheme not supported"),
-    };
+        _ => Err("URL scheme not supported")?,
+    }
 }
 
-fn handle_https_scheme(url: Url) {
+fn handle_https_scheme(url: Url) -> Result<TrackerResponse> {
     // send get request to tracker
-    let mut response = reqwest::blocking::get(url).unwrap();
+    let mut response = reqwest::blocking::get(url)?;
     //println!("{:?}", response.text().unwrap());
     let mut buf: Vec<u8> = vec![];
     response.copy_to(&mut buf).unwrap();
 
     // deserialize response to TrackerResponse
-    let tracker_res = de::from_bytes::<TrackerResponse>(&buf).expect("Err");
+    let tracker_res = de::from_bytes::<TrackerResponse>(&buf)?;
     println!("{}", tracker_res);
+    Ok(tracker_res)
 }
