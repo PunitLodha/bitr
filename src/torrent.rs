@@ -10,9 +10,9 @@ use crate::utils::bytes_to_string_with_encoding;
 use crate::Result;
 
 #[derive(Debug, Deserialize, Serialize)]
-struct Info {
+pub struct Info {
     name: String,
-    pieces: ByteBuf,
+    pub pieces: ByteBuf,
     #[serde(rename = "piece length")]
     piece_length: i64,
     #[serde(default)]
@@ -21,7 +21,7 @@ struct Info {
 
 #[derive(Debug, Deserialize)]
 pub struct Torrent {
-    info: Info,
+    pub info: Info,
     #[serde(default)]
     announce: Option<String>,
     #[serde(default)]
