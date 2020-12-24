@@ -4,6 +4,8 @@ use std::path::PathBuf;
 #[macro_use]
 extern crate serde_derive;
 
+mod manager;
+mod message;
 mod peer;
 mod torrent;
 mod tracker;
@@ -36,7 +38,9 @@ pub fn run() -> Result<()> {
     let client = Client::new(file_path)?;
     let torrent = Torrent::new(&client.path)?;
     println!("{}", &torrent);
-
+    let pieces = torrent.info.pieces.to_vec();
+    let x: Vec<&[u8]> = pieces.chunks_exact(20).collect();
+    println!("{}", x.len());
     let url = torrent.generate_tracker_url(&client.peer_id)?;
     println!("{}", url.as_str());
 
