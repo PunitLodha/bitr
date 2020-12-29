@@ -12,4 +12,6 @@ serde = "^1.0.0"
 serde_derive = "^1.0.0"
 serde_bytes = "0.11"
 reqwest = { version = "0.10", features = ["blocking"] }
-ring = {version = "0.16.15", features = ["std"]}
+ring = { version = "0.16.15", features = ["std"] }
+bitvec = "0.20.1"
+tokio = { version = "1", features = ["full"] }
