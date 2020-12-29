@@ -1,3 +1,5 @@
+use bitvec::{order::Msb0, prelude::BitVec};
+
 use crate::Result;
 
 #[derive(Debug)]
@@ -7,7 +9,7 @@ pub enum Msg {
     Interested,
     NotInterested,
     Have(u32),
-    Bitfield(Vec<u8>),
+    Bitfield(BitVec<Msb0, u8>),
     Request {
         index: u32,
         begin: u32,
@@ -40,7 +42,9 @@ impl Msg {
             5 => {
                 let payload = payload[1..].to_vec();
                 println!("{}", payload.len());
-                Msg::Bitfield(payload)
+                let bv = BitVec::<Msb0, u8>::from_vec(payload);
+                println!("{}", bv.len());
+                Msg::Bitfield(bv)
             }
             6 => Msg::Request {
                 index: u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]),
