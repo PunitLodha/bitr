@@ -1,9 +1,10 @@
 use bitr::run;
 use std::process;
 
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("Error: {}", e);
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {:?}", e);
         process::exit(1);
     }
 }

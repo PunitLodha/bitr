@@ -1,6 +1,8 @@
 use std::convert::TryInto;
 use std::error::Error;
 use std::path::PathBuf;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 #[macro_use]
 extern crate serde_derive;
@@ -12,12 +14,12 @@ mod torrent;
 mod tracker;
 mod utils;
 
+use manager::Command;
 use peer::Peer;
-
-use crate::torrent::Torrent;
+use torrent::Torrent;
 
 // create an alias for the result type
-pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 struct Client {
     path: PathBuf,
@@ -34,7 +36,7 @@ impl Client {
     }
 }
 
-pub fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     let file_path = std::env::args()
         .nth(1)
         .ok_or("path to torrent file is missing\nUsage: bitr <path to torrent file>")?;
@@ -59,9 +61,11 @@ pub fn run() -> Result<()> {
 
     let res = tracker::send_tracker_request(url)?;
 
-    // todo change this
-    //let peer = res.peers.iter().next().unwrap();
-    let peers = res
+    let info_hash = &torrent.info_hash;
+
+    let (send_to_manager, mut recieve_from_peers) = mpsc::unbounded_channel::<Command>();
+
+    let peer_list = res
         .peers
         .into_iter()
         .map(|tracker_peer| {
@@ -69,15 +73,167 @@ pub fn run() -> Result<()> {
                 tracker_peer.ip,
                 tracker_peer.port,
                 tracker_peer.peer_id.to_vec(),
-                no_of_pieces,
+                send_to_manager.clone(),
             )
         })
         .collect::<Vec<Peer>>();
-    peers.iter().nth(1).unwrap().connect(&torrent.info_hash)?;
-    //peer.connect_to_peer(peer, &torrent.info_hash, &client.peer_id)?;
+
+    /* let manager_task: JoinHandle<Result<()>> = tokio::spawn(async move {
+        let mut manager =
+            manager::Manager::new(no_of_pieces as u32, piece_hashes, piece_length as u32);
+
+        while let Some(cmd) = recieve_from_peers.recv().await {
+            match cmd {
+                Command::BitfieldRecieved { peer_id, bitfield } => {
+                    manager.piece_picker.register_bitfield(peer_id, bitfield);
+                    println!("Recieved bitfield from peer");
+                }
+                Command::PickInitialPieces {
+                    peer_id,
+                    transmitter,
+                } => {
+                    let blocks = manager.piece_picker.pick_intial_pieces(&peer_id);
+                    match blocks {
+                        Some(blks) => {
+                            if let Err(_) = transmitter.send(Command::SelectedInitialPieces(blks)) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                        None => {
+                            if let Err(_) = transmitter.send(Command::NoPiece) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                    }
+                }
+                Command::PickPiece {
+                    peer_id,
+                    transmitter,
+                } => {
+                    let block = manager.piece_picker.pick_piece(&peer_id);
+                    match block {
+                        Some(blk) => {
+                            if let Err(_) = transmitter.send(Command::SelectedPiece(blk)) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                        None => {
+                            if let Err(_) = transmitter.send(Command::NoPiece) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                    }
+                }
+                Command::HavePiece {
+                    peer_id,
+                    piece_index,
+                } => {
+                    manager
+                        .piece_picker
+                        .increment_piece_availability(piece_index);
+                    if let Some(bitfield) = manager.piece_picker.peer_bitfields.get_mut(&peer_id) {
+                        *bitfield.get_mut(piece_index).unwrap() = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }); */
+
+    let handles: Vec<JoinHandle<()>> = peer_list
+        .into_iter()
+        .map(|mut peer| {
+            let info = info_hash.clone();
+            let client_peer_id = client.peer_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = peer.connect(&info, &client_peer_id).await {
+                    eprintln!("Some error occured:- {:?}", e);
+                    eprintln!("Closing the connection");
+                };
+            })
+        })
+        .collect();
+
+    let mut manager = manager::Manager::new(no_of_pieces as u32, piece_hashes, piece_length as u32);
+
+    while let Some(cmd) = recieve_from_peers.recv().await {
+        match cmd {
+            Command::BitfieldRecieved { peer_id, bitfield } => {
+                manager.piece_picker.register_bitfield(peer_id, bitfield);
+                println!("Recieved bitfield from peer");
+            }
+            Command::PickInitialPieces {
+                peer_id,
+                transmitter,
+            } => {
+                let blocks = manager.piece_picker.pick_intial_pieces(&peer_id);
+                match blocks {
+                    Some(blks) => {
+                        if let Err(_) = transmitter.send(Command::SelectedInitialPieces(blks)) {
+                            eprintln!("Receiver Dropped");
+                        };
+                    }
+                    None => {
+                        if let Err(_) = transmitter.send(Command::NoPiece) {
+                            eprintln!("Receiver Dropped");
+                        };
+                    }
+                }
+            }
+            Command::PickPiece {
+                peer_id,
+                transmitter,
+            } => {
+                let block = manager.piece_picker.pick_piece(&peer_id);
+                match block {
+                    Some(blk) => {
+                        if let Err(_) = transmitter.send(Command::SelectedPiece(blk)) {
+                            eprintln!("Receiver Dropped");
+                        };
+                    }
+                    None => {
+                        if let Err(_) = transmitter.send(Command::NoPiece) {
+                            eprintln!("Receiver Dropped");
+                        };
+                    }
+                }
+            }
+            Command::HavePiece {
+                peer_id,
+                piece_index,
+            } => {
+                manager
+                    .piece_picker
+                    .increment_piece_availability(piece_index);
+                if let Some(bitfield) = manager.piece_picker.peer_bitfields.get_mut(&peer_id) {
+                    *bitfield.get_mut(piece_index).unwrap() = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /* let handles: Vec<JoinHandle<Result<()>>> = peer_list
+           .into_iter()
+           .map(|mut peer| {
+               let info = info_hash.clone();
+               let client_peer_id = client.peer_id.clone();
+               tokio::spawn(async move {
+                   if let Err(e) = peer.connect(&info, &client_peer_id).await {
+                       eprintln!("Some error occured:- {:?}", e);
+                       eprintln!("Closing the connection");
+                   };
+                   Ok(())
+               })
+           })
+           .collect();
+    */
+
+    for handle in handles {
+        handle.await?;
+    }
+    //manager_task.await??;
 
     Ok(())
-    /* for peer in res.peers.iter() {
-        peer::connect_to_peer(peer, &torrent.info_hash, &peer_id);
-    } */
 }
