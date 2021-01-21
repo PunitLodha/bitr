@@ -1,9 +1,15 @@
 use bitvec::{order::Msb0, prelude::BitVec};
-use std::collections::HashMap;
-use tokio::sync::oneshot;
+use std::convert::TryInto;
+use std::path::PathBuf;
+use std::{collections::HashMap, u32};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
+use tokio::task::JoinHandle;
 
-use crate::peer::Peer;
-use crate::Result;
+use crate::{peer::Peer, torrent::Torrent, tracker, utils};
+use crate::{tracker::TrackerResponse, Result};
 // TODO
 // Create an mpsc channel and clone the transmitter and give it to all the tasks
 // peers will send messages through this containing a oneshot transmitter
@@ -11,29 +17,76 @@ use crate::Result;
 // peer will  get the message using its oneshot receiver
 #[derive(Debug)]
 pub struct Manager {
+    path: PathBuf,
+    client_peer_id: Vec<u8>,
     //peer_list: Vec<Peer>,
-    pub piece_picker: PiecePicker,
+    torrent: Torrent,
+    //pub piece_picker: PiecePicker,
 }
 
 impl Manager {
-    pub fn new(
-        //peer_list: Vec<Peer>,
-        no_of_pieces: u32,
-        piece_hashes: Vec<[u8; 20]>,
-        piece_length: u32,
-    ) -> Self {
-        let piece_picker = PiecePicker::new(no_of_pieces, piece_hashes, piece_length);
-        Self {
-            //peer_list,
-            piece_picker,
-        }
+    pub fn new(file_path: String) -> Result<Manager> {
+        // path of the torrent file
+        let path = PathBuf::from(file_path);
+        // generate the peer id
+        let client_peer_id = utils::generate_peer_id()?;
+
+        let torrent = Torrent::new(&path)?;
+        Ok(Manager {
+            path,
+            client_peer_id,
+            torrent,
+        })
     }
-    /* pub fn connect_to_peers(&self, info_hash: &Vec<u8>) -> Result<()> {
-        for peer in self.peer_list.iter().nth(1) {
-            peer.connect(info_hash)?;
-        }
-        Ok(())
-    } */
+    pub fn send_tracker_request(&self) -> Result<TrackerResponse> {
+        let url = self.torrent.generate_tracker_url(&self.client_peer_id)?;
+        println!("{}", url.as_str());
+
+        let res = tracker::send_tracker_request(url)?;
+        Ok(res)
+    }
+    pub fn spawn_piece_picker(&self) -> PiecePicker {
+        let pieces = self.torrent.info.pieces.to_vec();
+        let piece_hashes: Vec<[u8; 20]> = pieces
+            .chunks_exact(20)
+            // try to remove this unwrap
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+        let total_pieces = piece_hashes.len();
+        println!("{}", total_pieces);
+
+        let piece_length = self.torrent.info.piece_length;
+
+        let piece_picker = PiecePicker::new(total_pieces as u32, piece_hashes, piece_length as u32);
+        piece_picker
+    }
+    pub fn connect_to_peers(
+        &self,
+        res: TrackerResponse,
+        send_to_manager: UnboundedSender<Command>,
+    ) -> Vec<JoinHandle<()>> {
+        let handles: Vec<JoinHandle<()>> = res
+            .peers
+            .into_iter()
+            .map(|tracker_peer| {
+                let mut peer = Peer::new(
+                    tracker_peer.ip,
+                    tracker_peer.port,
+                    tracker_peer.peer_id.to_vec(),
+                    send_to_manager.clone(),
+                );
+                let info = self.torrent.info_hash.clone();
+                let client_peer_id = self.client_peer_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = peer.connect(&info, &client_peer_id).await {
+                        eprintln!("Some error occured:- {:?}", e);
+                        eprintln!("Closing the connection");
+                    };
+                })
+            })
+            .collect();
+        handles
+    }
 }
 
 #[derive(Debug)]
@@ -171,6 +224,62 @@ impl PiecePicker {
         for i in 1..=index {
             let curr_piece = self.pieces[i];
             self.piece_map[curr_piece as usize].index += 1;
+        }
+    }
+    pub async fn listen_to_commands(&mut self, mut receive_from_peers: UnboundedReceiver<Command>) {
+        while let Some(cmd) = receive_from_peers.recv().await {
+            match cmd {
+                Command::BitfieldRecieved { peer_id, bitfield } => {
+                    self.register_bitfield(peer_id, bitfield);
+                    println!("Recieved bitfield from peer");
+                }
+                Command::PickInitialPieces {
+                    peer_id,
+                    transmitter,
+                } => {
+                    let blocks = self.pick_intial_pieces(&peer_id);
+                    match blocks {
+                        Some(blks) => {
+                            if let Err(_) = transmitter.send(Command::SelectedInitialPieces(blks)) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                        None => {
+                            if let Err(_) = transmitter.send(Command::NoPiece) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                    }
+                }
+                Command::PickPiece {
+                    peer_id,
+                    transmitter,
+                } => {
+                    let block = self.pick_piece(&peer_id);
+                    match block {
+                        Some(blk) => {
+                            if let Err(_) = transmitter.send(Command::SelectedPiece(blk)) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                        None => {
+                            if let Err(_) = transmitter.send(Command::NoPiece) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                    }
+                }
+                Command::HavePiece {
+                    peer_id,
+                    piece_index,
+                } => {
+                    self.increment_piece_availability(piece_index);
+                    if let Some(bitfield) = self.peer_bitfields.get_mut(&peer_id) {
+                        *bitfield.get_mut(piece_index).unwrap() = true;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
