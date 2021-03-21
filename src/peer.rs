@@ -1,10 +1,9 @@
-use bitvec::{bitvec, order::Msb0, prelude::BitVec};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
-use crate::{manager::Block, Result};
 use crate::{manager::Command, message::Msg};
+use crate::{manager::DownloadedBlock, Result};
 
 struct Handshake<'a> {
     info_hash: &'a Vec<u8>,
@@ -144,6 +143,7 @@ impl Peer {
             match msg {
                 Msg::Bitfield(bitfield) => {
                     //todo might not need to clone peer id here
+                    println!("Recieved bitfield from peer: {}", self.ip);
                     let peer_id = self.peer_id.clone();
                     self.transmitter
                         .send(Command::BitfieldRecieved { peer_id, bitfield })?;
@@ -210,12 +210,16 @@ impl Peer {
                     //ignore
                 }
                 Msg::Piece {
-                    index: _,
-                    begin: _,
-                    block: _,
+                    index,
+                    begin,
+                    block,
                 } => {
                     // write the block
-                    println!("Got piece from peer");
+                    //println!("Got piece from peer");
+                    let downloaded_block = DownloadedBlock::new(index, begin, block);
+                    self.transmitter
+                        .send(Command::DownloadedBlock(downloaded_block))?;
+
                     let (tx, rx) = oneshot::channel::<Command>();
                     self.transmitter.send(Command::PickPiece {
                         peer_id: self.peer_id.clone(),
