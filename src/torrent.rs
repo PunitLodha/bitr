@@ -11,12 +11,12 @@ use crate::Result;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Info {
-    name: String,
+    pub name: String,
     pub pieces: ByteBuf,
     #[serde(rename = "piece length")]
     pub piece_length: u64,
     #[serde(default)]
-    length: Option<i64>,
+    pub length: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
