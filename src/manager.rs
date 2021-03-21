@@ -1,14 +1,15 @@
 use bitvec::{order::Msb0, prelude::BitVec};
-use std::convert::TryInto;
+use ring::digest;
 use std::path::PathBuf;
 use std::{collections::HashMap, u32};
+use std::{convert::TryInto, usize};
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
     oneshot,
 };
 use tokio::task::JoinHandle;
 
-use crate::{peer::Peer, torrent::Torrent, tracker, utils};
+use crate::{disk::DiskManager, peer::Peer, torrent::Torrent, tracker, utils};
 use crate::{tracker::TrackerResponse, Result};
 // TODO
 // Create an mpsc channel and clone the transmitter and give it to all the tasks
@@ -45,7 +46,10 @@ impl Manager {
         let res = tracker::send_tracker_request(url)?;
         Ok(res)
     }
-    pub fn spawn_piece_picker(&self) -> PiecePicker {
+    pub fn spawn_piece_picker(
+        &self,
+        send_to_disk_manager: UnboundedSender<DownloadedPiece>,
+    ) -> PiecePicker {
         let pieces = self.torrent.info.pieces.to_vec();
         let piece_hashes: Vec<[u8; 20]> = pieces
             .chunks_exact(20)
@@ -56,9 +60,28 @@ impl Manager {
         println!("{}", total_pieces);
 
         let piece_length = self.torrent.info.piece_length;
+        let file_length = self.torrent.info.length.unwrap();
 
-        let piece_picker = PiecePicker::new(total_pieces as u32, piece_hashes, piece_length as u32);
+        let piece_picker = PiecePicker::new(
+            total_pieces as u32,
+            piece_hashes,
+            piece_length as u32,
+            file_length as u32,
+            send_to_disk_manager,
+        );
         piece_picker
+    }
+    pub fn spawn_disk_manager(
+        &self,
+        receive_pieces: UnboundedReceiver<DownloadedPiece>,
+    ) -> Result<DiskManager> {
+        let disk_manager = DiskManager::new(
+            receive_pieces,
+            &self.torrent.info.name,
+            self.torrent.info.piece_length,
+            (self.torrent.info.pieces.to_vec().len() / 20) as u32,
+        )?;
+        Ok(disk_manager)
     }
     pub fn connect_to_peers(
         &self,
@@ -91,6 +114,8 @@ impl Manager {
 
 #[derive(Debug)]
 pub struct PiecePicker {
+    file_length: u32,
+    total_pieces: u32,
     piece_map: Vec<PiecePos>,
     pieces: Vec<u32>,
     priority_boundaries: Vec<u32>,
@@ -98,10 +123,18 @@ pub struct PiecePicker {
     piece_hashes: Vec<[u8; 20]>,
     piece_length: u32,
     pub peer_bitfields: HashMap<Vec<u8>, BitVec<Msb0, u8>>,
+    send_to_disk_manager: UnboundedSender<DownloadedPiece>,
+    downloaded_pieces: HashMap<u32, DownloadedPiece>,
 }
 
 impl PiecePicker {
-    pub fn new(total_pieces: u32, piece_hashes: Vec<[u8; 20]>, piece_length: u32) -> Self {
+    pub fn new(
+        total_pieces: u32,
+        piece_hashes: Vec<[u8; 20]>,
+        piece_length: u32,
+        file_length: u32,
+        send_to_disk_manager: UnboundedSender<DownloadedPiece>,
+    ) -> Self {
         let piece_map = (0..total_pieces)
             .map(|index| PiecePos::new(0, PieceState::NotDownloading, index))
             .collect();
@@ -112,6 +145,8 @@ impl PiecePicker {
         // so we assume a safe number of 50 max peers connected at a time
         let priority_boundaries = vec![total_pieces; 50];
         Self {
+            file_length,
+            total_pieces,
             piece_map,
             pieces,
             priority_boundaries,
@@ -119,6 +154,8 @@ impl PiecePicker {
             piece_hashes,
             piece_length,
             peer_bitfields: HashMap::new(),
+            send_to_disk_manager,
+            downloaded_pieces: HashMap::new(),
         }
     }
     pub fn register_bitfield(&mut self, peer_id: Vec<u8>, mut bitfield: BitVec<Msb0, u8>) {
@@ -129,6 +166,9 @@ impl PiecePicker {
         // try to somehow generalize the case
         for (piece, available_piece) in bitfield.iter().enumerate() {
             if *available_piece {
+                if piece == 0 {
+                    println!("{}, {:?}", piece, peer_id);
+                }
                 self.increment_piece_availability(piece);
             }
         }
@@ -136,6 +176,9 @@ impl PiecePicker {
     }
     pub fn increment_piece_availability(&mut self, piece: usize) {
         let avail = self.piece_map[piece].peer_count;
+        if piece == 0 {
+            println!("{}, {}", piece, avail);
+        }
         self.priority_boundaries[avail as usize] -= 1;
         self.piece_map[piece].peer_count += 1;
         let piece_index = self.piece_map[piece].index;
@@ -178,16 +221,26 @@ impl PiecePicker {
         for (index, piece) in self.pieces.iter().enumerate() {
             // if peer has the piece
             if peer_bitfield[*piece as usize] {
+                // check if final piece
+                let piece_length = if index as u32 == self.total_pieces - 1 {
+                    self.file_length - (index as u32 * self.piece_length)
+                } else {
+                    self.piece_length
+                };
                 let downloading_piece = self
                     .downloading
                     .entry(*piece)
-                    .or_insert(DownloadingPiece::new(*piece, self.piece_length));
+                    .or_insert(DownloadingPiece::new(*piece, piece_length));
 
                 for block in downloading_piece.blocks.iter_mut() {
                     if let BlockState::Open = block.state {
                         selected_index = index;
                         block.state = BlockState::Requested;
-                        selected_block = Some(Block::new(block.piece_index, block.begin));
+                        selected_block = Some(Block::new(
+                            block.piece_index,
+                            block.begin,
+                            Some(block.length),
+                        ));
                         break;
                     }
                 }
@@ -231,7 +284,7 @@ impl PiecePicker {
             match cmd {
                 Command::BitfieldRecieved { peer_id, bitfield } => {
                     self.register_bitfield(peer_id, bitfield);
-                    println!("Recieved bitfield from peer");
+                    //println!("Recieved bitfield from peer");
                 }
                 Command::PickInitialPieces {
                     peer_id,
@@ -273,9 +326,47 @@ impl PiecePicker {
                     peer_id,
                     piece_index,
                 } => {
-                    self.increment_piece_availability(piece_index);
+                    let mut already_has_piece = false;
                     if let Some(bitfield) = self.peer_bitfields.get_mut(&peer_id) {
-                        *bitfield.get_mut(piece_index).unwrap() = true;
+                        if !(*bitfield.get_mut(piece_index).unwrap()) {
+                            *bitfield.get_mut(piece_index).unwrap() = true;
+                        } else {
+                            already_has_piece = true
+                        };
+                    }
+                    if !already_has_piece {
+                        self.increment_piece_availability(piece_index);
+                    }
+                }
+                Command::DownloadedBlock(block) => {
+                    let index = block.piece_index;
+                    // check if final piece
+                    let piece_length = if index as u32 == self.total_pieces - 1 {
+                        self.file_length - (index as u32 * self.piece_length)
+                    } else {
+                        self.piece_length
+                    };
+                    let downloaded_piece = self
+                        .downloaded_pieces
+                        .entry(index)
+                        .or_insert(DownloadedPiece::new(index, piece_length));
+                    downloaded_piece.add_downloaded_block(block);
+                    if downloaded_piece.all_blocks_downloaded {
+                        let piece_data =
+                            downloaded_piece.blocks.iter().fold(vec![], |mut acc, blk| {
+                                acc.extend_from_slice(&blk.data);
+                                acc
+                            });
+                        let sha1 = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &piece_data);
+                        let sha1 = sha1.as_ref();
+                        //check if the hash matches
+                        if sha1 == self.piece_hashes.get(index as usize).unwrap() {
+                            let piece = self.downloaded_pieces.remove(&index).unwrap();
+                            if let Err(_) = self.send_to_disk_manager.send(piece) {
+                                eprintln!("Receiver Dropped");
+                            };
+                        }
+                        // todo implement part where hashes dont match
                     }
                 }
                 _ => {}
@@ -308,7 +399,7 @@ enum PieceState {
 }
 
 #[derive(Debug)]
-struct DownloadingPiece {
+pub struct DownloadingPiece {
     // kind of redundant, maybe remove it later
     index: u32,
     blocks: Vec<Block>,
@@ -318,9 +409,19 @@ impl DownloadingPiece {
     // todo check for last piece and make necessary changes to no of blocks
     fn new(index: u32, piece_length: u32) -> Self {
         const BLOCK_LENGTH: u32 = 16384;
-        let no_of_blocks = piece_length / BLOCK_LENGTH;
+        let mut no_of_blocks = piece_length / BLOCK_LENGTH;
+        let final_block_len = piece_length % BLOCK_LENGTH;
+        if final_block_len != 0 {
+            no_of_blocks += 1
+        }
         let blocks = (0..no_of_blocks)
-            .map(|i| Block::new(index, i * 16384))
+            .map(|i| {
+                if (final_block_len != 0) && (index == no_of_blocks - 1) {
+                    Block::new(index, i * 16384, Some(final_block_len))
+                } else {
+                    Block::new(index, i * 16384, None)
+                }
+            })
             .collect();
         Self { index, blocks }
     }
@@ -345,8 +446,8 @@ pub struct Block {
 }
 
 impl Block {
-    fn new(piece_index: u32, begin: u32) -> Self {
-        let length = 16384;
+    fn new(piece_index: u32, begin: u32, block_length: Option<u32>) -> Self {
+        let length = block_length.unwrap_or(16384);
         let state = BlockState::Open;
         Self {
             piece_index,
@@ -354,6 +455,59 @@ impl Block {
             length,
             state,
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct DownloadedBlock {
+    /// the piece which the block belongs to
+    pub piece_index: u32,
+    /// zero-based byte offset within the piece
+    pub begin: u32,
+    pub data: Vec<u8>,
+}
+
+impl DownloadedBlock {
+    pub fn new(piece_index: u32, begin: u32, data: Vec<u8>) -> Self {
+        Self {
+            piece_index,
+            begin,
+            data,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DownloadedPiece {
+    pub index: u32,
+    pub blocks: Vec<DownloadedBlock>,
+    all_blocks_downloaded: bool,
+}
+
+impl DownloadedPiece {
+    pub fn new(index: u32, piece_length: u32) -> Self {
+        const BLOCK_LENGTH: u32 = 16384;
+        let mut no_of_blocks = piece_length / BLOCK_LENGTH;
+        let final_block_len = piece_length % BLOCK_LENGTH;
+        if final_block_len != 0 {
+            no_of_blocks += 1
+        }
+        let blocks = (0..no_of_blocks)
+            .map(|i| DownloadedBlock::new(index, i * 16384, vec![]))
+            .collect();
+        Self {
+            index,
+            blocks,
+            all_blocks_downloaded: false,
+        }
+    }
+    pub fn add_downloaded_block(&mut self, block: DownloadedBlock) {
+        let block_index = block.begin / 16384;
+        if let Some(blk) = self.blocks.get_mut(block_index as usize) {
+            blk.data = block.data;
+        }
+        let all_blocks_downloaded = self.blocks.iter().all(|block| !block.data.is_empty());
+        self.all_blocks_downloaded = all_blocks_downloaded;
     }
 }
 
@@ -375,70 +529,9 @@ pub enum Command {
     SelectedInitialPieces(Vec<Option<Block>>),
     SelectedPiece(Block),
     NoPiece,
-    DownloadedPiece,
+    DownloadedBlock(DownloadedBlock),
     HavePiece {
         peer_id: Vec<u8>,
         piece_index: usize,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bitvec::bitvec;
-
-    #[test]
-    fn update_availablity_of_one_piece() -> Result<()> {
-        let total_pieces = 3;
-        let piece_length = 262144;
-        let piece_hashes: Vec<[u8; 20]> = vec![];
-        let mut piece_picker = PiecePicker::new(total_pieces, piece_hashes, piece_length);
-
-        let bitfield = bitvec![Msb0,u8;0,1,0];
-        piece_picker.register_bitfield(vec![], bitfield);
-        assert_eq!(piece_picker.piece_map[1].index, 2);
-
-        let bitfield = bitvec![Msb0,u8;0,1,0];
-        piece_picker.register_bitfield(vec![], bitfield);
-        assert_eq!(piece_picker.piece_map[1].index, 2);
-
-        let bitfield = bitvec![Msb0,u8;1,0,0];
-        piece_picker.register_bitfield(vec![], bitfield);
-        assert_eq!(piece_picker.piece_map[0].index, 1);
-
-        let bitfield = bitvec![Msb0,u8;1,1,1];
-        piece_picker.register_bitfield(vec![], bitfield);
-        assert_eq!(piece_picker.piece_map[0].index, 1);
-        assert_eq!(piece_picker.piece_map[1].index, 2);
-        assert_eq!(piece_picker.piece_map[2].index, 0);
-
-        piece_picker.priortize_downloading_piece(1);
-
-        Ok(())
-    }
-
-    #[test]
-    fn update_availablity_of_one_pieces() -> Result<()> {
-        let b = bitvec![Msb0,u8;0,1,0,0,1];
-        let total_pieces = 5;
-        let piece_length = 262144;
-        let piece_hashes: Vec<[u8; 20]> = vec![];
-        let mut piece_picker = PiecePicker::new(total_pieces, piece_hashes, piece_length);
-
-        let bitfield = bitvec![Msb0,u8;0,1,0,0,1];
-        piece_picker.register_bitfield(vec![], bitfield);
-
-        let bitfield = bitvec![Msb0,u8;1,0,0,1,0];
-        piece_picker.register_bitfield(vec![], bitfield);
-
-        let bitfield = bitvec![Msb0,u8;0,1,0,1,0];
-        piece_picker.register_bitfield(vec![], bitfield);
-
-        let bitfield = bitvec![Msb0,u8;1,1,1,1,1];
-        piece_picker.register_bitfield(vec![], bitfield);
-        piece_picker.decrement_piece_availability(0);
-        dbg!(piece_picker);
-
-        Ok(())
-    }
 }
